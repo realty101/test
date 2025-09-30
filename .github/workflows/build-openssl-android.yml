@@ -1,0 +1,98 @@
+name: Build OpenSSL for Android (PIC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      openssl_version:
+        description: "OpenSSL version (e.g., 3.0.18 or 3.3.5)"
+        required: true
+        default: "3.0.18"
+      api_level:
+        description: "Android API level (34 推奨; 35 ラッパーが無い環境でもOK)"
+        required: true
+        default: "34"
+      abis:
+        description: "Comma-separated ABIs: arm64-v8a,armeabi-v7a,x86_64"
+        required: true
+        default: "arm64-v8a"
+      ndk_version:
+        description: "Android NDK r26.x (e.g., 26.1.10909125)"
+        required: true
+        default: "26.1.10909125"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      API_LEVEL: ${{ inputs.api_level }}
+      OPENSSL_VERSION: ${{ inputs.openssl_version }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+    steps:
+      - name: Checkout (empty repo is fine)
+        uses: actions/checkout@v4
+
+      - name: Install build deps (Perl/make/zip)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y perl make build-essential ca-certificates curl tar unzip
+
+      - name: Download Android NDK r26
+        run: |
+          curl -L -o ndk.zip "https://dl.google.com/android/repository/android-ndk-r${NDK_VERSION}-linux.zip"
+          unzip -q ndk.zip
+          echo "ANDROID_NDK_HOME=$GITHUB_WORKSPACE/android-ndk-r${NDK_VERSION}" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/android-ndk-r${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Download OpenSSL source
+        run: |
+          curl -L -o openssl.tar.gz "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          mkdir src && tar -xf openssl.tar.gz -C src
+          echo "OPENSSL_SRC=$(echo $GITHUB_WORKSPACE/src/openssl-*)" >> $GITHUB_ENV
+
+      - name: Build (PIC, static, per-ABI)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          OPENSSL_SRC: ${{ env.OPENSSL_SRC }}
+        run: |
+          set -e
+          IFS=',' read -ra ABIS <<< "${{ inputs.abis }}"
+          for ABI in "${ABIS[@]}"; do
+            case "$ABI" in
+              arm64-v8a) TARGET=android-arm64;  TRIPLE=aarch64-linux-android ;;
+              armeabi-v7a) TARGET=android-arm;  TRIPLE=armv7a-linux-androideabi ;;
+              x86_64) TARGET=android-x86_64; TRIPLE=x86_64-linux-android ;;
+              *) echo "Unsupported ABI: $ABI"; exit 1 ;;
+            esac
+
+            cd "$OPENSSL_SRC"
+            make clean || true
+
+            export CC="clang"
+            export CXX="clang++"
+            export AR="llvm-ar"
+            export RANLIB="llvm-ranlib"
+            export CFLAGS="-fPIC --target=${TRIPLE}${API_LEVEL} -D__ANDROID_API__=${API_LEVEL}"
+            export CXXFLAGS="${CFLAGS}"
+            export LDFLAGS="--target=${TRIPLE}${API_LEVEL}"
+
+            # Configure (static only)
+            perl Configure "$TARGET" -D__ANDROID_API__=${API_LEVEL} no-shared no-tests no-comp no-hw no-engine
+
+            make -j$(nproc)
+
+            # stash artifacts
+            OUT="$GITHUB_WORKSPACE/out/$ABI"
+            mkdir -p "$OUT/include"
+            cp -v libcrypto.a "$OUT/"
+            cp -rv include/* "$OUT/include/"
+
+            # prepare for next ABI
+            git -C "$OPENSSL_SRC" clean -fdx >/dev/null 2>&1 || true
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-android-static-${{ inputs.openssl_version }}-api${{ inputs.api_level }}
+          path: |
+            out/**
