@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       openssl_version:
-        description: "OpenSSL version (e.g., 3.0.18 or 3.3.5)"
+        description: "OpenSSL version"
         required: true
         default: "3.0.18"
       api_level:
-        description: "Android API level (34 推奨; 35 ラッパーが無い環境でもOK)"
+        description: "Android API level"
         required: true
         default: "34"
       abis:
-        description: "Comma-separated ABIs: arm64-v8a,armeabi-v7a,x86_64"
+        description: "arm64-v8a,armeabi-v7a,x86_64"
         required: true
         default: "arm64-v8a"
-      ndk_version:
-        description: "Android NDK r26.x (e.g., 26.1.10909125)"
+      ndk_full:
+        description: "NDK full version for sdkmanager (e.g. 26.1.10909125)"
         required: true
         default: "26.1.10909125"
 
@@ -26,22 +26,35 @@ jobs:
     env:
       API_LEVEL: ${{ inputs.api_level }}
       OPENSSL_VERSION: ${{ inputs.openssl_version }}
-      NDK_VERSION: ${{ inputs.ndk_version }}
+      NDK_FULL: ${{ inputs.ndk_full }}
+
     steps:
-      - name: Checkout (empty repo is fine)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build deps (Perl/make/zip)
+      - name: Install deps (Perl/make + Android cmdline-tools deps)
         run: |
           sudo apt-get update
-          sudo apt-get install -y perl make build-essential ca-certificates curl tar unzip
+          sudo apt-get install -y perl make build-essential curl unzip zip
 
-      - name: Download Android NDK r26
+      # ▼ ここがポイント：SDK Manager で NDK をインストール
+      - name: Install Android SDK cmdline-tools + NDK
         run: |
-          curl -L -o ndk.zip "https://dl.google.com/android/repository/android-ndk-r${NDK_VERSION}-linux.zip"
-          unzip -q ndk.zip
-          echo "ANDROID_NDK_HOME=$GITHUB_WORKSPACE/android-ndk-r${NDK_VERSION}" >> $GITHUB_ENV
-          echo "$GITHUB_WORKSPACE/android-ndk-r${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          set -e
+          ANDROID_SDK_ROOT=$HOME/android-sdk
+          mkdir -p "$ANDROID_SDK_ROOT"
+          curl -L -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          unzip -q cmdtools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          # cmdline-tools は 'latest' サブフォルダに配置するのがコツ
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools/"* "$ANDROID_SDK_ROOT/cmdline-tools/latest/"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platforms;android-${API_LEVEL}" "platform-tools" "ndk;${NDK_FULL}"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_FULL}" >> $GITHUB_ENV
+          echo "$ANDROID_SDK_ROOT/ndk/${NDK_FULL}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
       - name: Download OpenSSL source
         run: |
@@ -49,7 +62,7 @@ jobs:
           mkdir src && tar -xf openssl.tar.gz -C src
           echo "OPENSSL_SRC=$(echo $GITHUB_WORKSPACE/src/openssl-*)" >> $GITHUB_ENV
 
-      - name: Build (PIC, static, per-ABI)
+      - name: Build (PIC, static)
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
           OPENSSL_SRC: ${{ env.OPENSSL_SRC }}
@@ -75,18 +88,14 @@ jobs:
             export CXXFLAGS="${CFLAGS}"
             export LDFLAGS="--target=${TRIPLE}${API_LEVEL}"
 
-            # Configure (static only)
             perl Configure "$TARGET" -D__ANDROID_API__=${API_LEVEL} no-shared no-tests no-comp no-hw no-engine
-
             make -j$(nproc)
 
-            # stash artifacts
             OUT="$GITHUB_WORKSPACE/out/$ABI"
             mkdir -p "$OUT/include"
             cp -v libcrypto.a "$OUT/"
             cp -rv include/* "$OUT/include/"
 
-            # prepare for next ABI
             git -C "$OPENSSL_SRC" clean -fdx >/dev/null 2>&1 || true
           done
 
@@ -94,5 +103,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openssl-android-static-${{ inputs.openssl_version }}-api${{ inputs.api_level }}
-          path: |
-            out/**
+          path: out/**
